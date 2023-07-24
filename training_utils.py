@@ -3,16 +3,61 @@ from deepinv.utils import (
     AverageMeter,
     ProgressMeter,
     get_timestamp,
-    cal_psnr,
 )
+from deepinv.physics import LinearPhysics
 from deepinv.utils import plot, plot_curves, wandb_imgs, wandb_plot_curves
 import numpy as np
 from tqdm import tqdm
+from torchvision import transforms, datasets
 import torch
 import wandb
 import matplotlib.pyplot as plt
 import matplotlib
 from pathlib import Path
+import torch.nn as nn
+import h5py
+from torch.utils.data import DataLoader, Subset
+import os
+from torch.utils import data
+
+
+def norm(a):
+    return a.pow(2).sum(dim=3).sum(dim=2).sqrt().unsqueeze(2).unsqueeze(3)
+
+
+def cal_psnr(a, b, max_pixel=1, normalize=False):
+    r"""
+    Computes the peak signal-to-noise ratio (PSNR)
+
+    If the tensors have size (N, C, H, W), then the PSNR is computed as
+
+    .. math::
+        \text{PSNR} = \frac{20}{N} \log_{10} \frac{MAX_I}{\sqrt{\|a- b\|^2_2 / (CHW) }}
+
+    where :math:`MAX_I` is the maximum possible pixel value of the image (e.g. 1.0 for a
+    normalized image), and :math:`a` and :math:`b` are the estimate and reference images.
+
+    :param torch.Tensor a: tensor estimate
+    :param torch.Tensor b: tensor reference
+    :param float max_pixel: maximum pixel value
+    :param bool normalize: if ``True``, a is normalized to have the same norm as b.
+    """
+    with torch.no_grad():
+        if type(a) is list or type(a) is tuple:
+            a = a[0]
+            b = b[0]
+
+        if normalize:
+            an = a / norm(a) * norm(b)
+        else:
+            an = a
+
+        mse = (an - b).pow(2).reshape(an.shape[0], -1).mean(dim=1)
+        mse[mse == 0] = 1e-10
+        psnr = 20 * torch.log10(max_pixel / mse.sqrt())
+
+    return psnr.mean().detach().cpu().item()
+
 
 matplotlib.rcParams.update({"font.size": 17})
 matplotlib.rcParams["lines.linewidth"] = 2
@@ -23,25 +68,25 @@ if use_tex:
 
 
 def train(
-    model,
-    train_dataloader,
-    epochs,
-    losses,
-    eval_dataloader=None,
-    physics=None,
-    optimizer=None,
-    scheduler=None,
-    device="cpu",
-    ckp_interval=1,
-    eval_interval=1,
-    log_interval=1,
-    save_path=".",
-    verbose=False,
-    unsupervised=False,
-    plot_images=False,
-    plot_metrics=False,
-    wandb_vis=False,
-    n_plot_max_wandb=8,
+        model,
+        train_dataloader,
+        epochs,
+        losses,
+        eval_dataloader=None,
+        physics=None,
+        optimizer=None,
+        scheduler=None,
+        device="cpu",
+        ckp_interval=1,
+        eval_interval=1,
+        log_interval=1,
+        save_path=".",
+        verbose=False,
+        unsupervised=False,
+        plot_images=False,
+        plot_metrics=False,
+        wandb_vis=False,
+        n_plot_max_wandb=8,
 ):
     r"""
     Trains a reconstruction network.
@@ -129,45 +174,41 @@ def train(
             meter.reset()
         iterators = [iter(loader) for loader in train_dataloader]
         batches = len(train_dataloader[G - 1])
+
         for i in range(batches):
             G_perm = np.random.permutation(G)
-
             for g in G_perm:
                 if unsupervised:
                     y = next(iterators[g])
                     x = None
                 else:
                     x, y = next(iterators[g])
+                    y = y.to(device)
 
                     if type(x) is list or type(x) is tuple:
                         x = [s.to(device) for s in x]
                     else:
                         x = x.to(device)
 
-                y = y.to(device)
-
-                optimizer.zero_grad()
-
                 x_net = model(y, physics[g])
 
-                loss_total = 0
+                loss_total = 0.
                 for k, l in enumerate(losses):
                     loss = l(x=x, x_net=x_net, y=y, physics=physics[g], model=model)
                     loss_total += loss
                     losses_verbose[k].update(loss.item())
 
-                loss_meter.update(loss_total.item())
-
                 if (not unsupervised) and verbose:
                     train_psnr_net.update(cal_psnr(x_net, x, normalize=True))
 
+                # gradient step
+                optimizer.zero_grad()
                 loss_total.backward()
                 optimizer.step()
-
         if (
-            (not unsupervised)
-            and eval_dataloader
-            and ((epoch + 1) % eval_interval == 0 or (epoch + 1) == epochs)
+                (not unsupervised)
+                and eval_dataloader
+                and ((epoch + 1) % eval_interval == 0 or (epoch + 1) == epochs)
         ):
             test_psnr, _, _, _ = test(
                 model,
@@ -216,19 +257,19 @@ def train(
 
 
 def test(
-    model,
-    test_dataloader,
-    physics,
-    device="cpu",
-    plot_images=False,
-    save_folder="results",
-    plot_metrics=False,
-    verbose=True,
-    plot_only_first_batch=True,
-    wandb_vis=False,
-    step=0,
-    n_plot_max_wandb=8,
-    **kwargs,
+        model,
+        test_dataloader,
+        physics,
+        device="cpu",
+        plot_images=False,
+        save_folder="results",
+        plot_metrics=False,
+        verbose=True,
+        plot_only_first_batch=True,
+        wandb_vis=False,
+        step=0,
+        n_plot_max_wandb=8,
+        **kwargs,
 ):
     r"""
     Tests a reconstruction network.
@@ -277,7 +318,7 @@ def test(
     for g in range(G):
         dataloader = test_dataloader[g]
         if verbose:
-            print(f"Processing data of operator {g+1} out of {G}")
+            print(f"Processing data of operator {g + 1} out of {G}")
         for i, (x, y) in enumerate(tqdm(dataloader, disable=not verbose)):
             if type(x) is list or type(x) is tuple:
                 x = [s.to(device) for s in x]
@@ -292,6 +333,10 @@ def test(
                     x1 = model(y, physics[g])
 
             x_init = physics[g].A_adjoint(y)
+
+            x_init /= norm(x)/norm(x_init)
+            x1 /= norm(x)/norm(x1)
+
             cur_psnr_init = cal_psnr(x_init, x, normalize=True)
             cur_psnr = cal_psnr(x1, x, normalize=True)
             psnr_init.append(cur_psnr_init)
@@ -302,15 +347,15 @@ def test(
 
             if plot_images:
                 save_folder_im = (
-                    (save_folder / ("G" + str(g))) if G > 1 else save_folder
-                ) / "images"
+                                     (save_folder / ("G" + str(g))) if G > 1 else save_folder
+                                 ) / "images"
                 save_folder_im.mkdir(parents=True, exist_ok=True)
             else:
                 save_folder_im = None
             if plot_metrics:
                 save_folder_curve = (
-                    (save_folder / ("G" + str(g))) if G > 1 else save_folder
-                ) / "curves"
+                                        (save_folder / ("G" + str(g))) if G > 1 else save_folder
+                                    ) / "curves"
                 save_folder_curve.mkdir(parents=True, exist_ok=True)
 
             if plot_images or wandb_vis:
