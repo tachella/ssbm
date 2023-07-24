@@ -11,9 +11,9 @@ for most of the code.
 
 # Getting Started
 1. Clone the repository
-2. Install deepinv
+2. Install the latest version of deepinv
 ```
-pip install deepinv
+pip install git+https://github.com/deepinv/deepinv.git#egg=deepinv
 ```
 3. Run the `main.py` file to train a self-supervised model. 
 You can easily modify the dataset and other parameters in the `main.py` file.
